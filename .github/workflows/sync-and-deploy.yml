@@ -104,6 +104,13 @@ jobs:
           compatibility_date = "2026-07-04"
           keep_vars = true
           workers_dev = true
+          preview_urls = false
+
+          [observability]
+          enabled = true
+
+          [observability.logs]
+          enabled = true
 
           [[kv_namespaces]]
           binding = "KV"
