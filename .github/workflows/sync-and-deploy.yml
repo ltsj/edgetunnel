@@ -1,0 +1,156 @@
+name: Sync upstream and deploy Worker
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: Deploy the current main branch even if it was deployed before
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: sync-and-deploy-production
+  cancel-in-progress: false
+
+jobs:
+  sync-and-deploy:
+    if: github.repository == 'ltsj/edgetunnel'
+    runs-on: ubuntu-latest
+    env:
+      ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+      AUTODEPLOY_ENABLED: ${{ vars.AUTODEPLOY_ENABLED }}
+      HEALTH_URL: ${{ vars.CF_HEALTH_URL }}
+      KV_NAMESPACE_ID: ${{ vars.CF_KV_NAMESPACE_ID }}
+      WORKER_NAME: ${{ vars.CF_WORKER_NAME }}
+
+    steps:
+      - name: Sync fork with cmliu/edgetunnel
+        id: sync
+        env:
+          FORCE_DEPLOY: ${{ inputs.force_deploy || false }}
+          GH_TOKEN: ${{ github.token }}
+          LAST_DEPLOYED_SHA: ${{ vars.DEPLOYED_SHA }}
+        run: |
+          response="$(gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/merge-upstream" \
+            -f branch=main)"
+
+          message="$(jq -r '.message' <<<"$response")"
+          current_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha')"
+          should_deploy=false
+
+          if [[ "$FORCE_DEPLOY" == "true" || "$current_sha" != "$LAST_DEPLOYED_SHA" ]]; then
+            should_deploy=true
+          fi
+
+          echo "$message"
+          echo "current_sha=$current_sha" >> "$GITHUB_OUTPUT"
+          echo "should_deploy=$should_deploy" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the synchronized branch
+        if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Validate deployment configuration
+        if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          for value in \
+            "$ACCOUNT_ID" \
+            "$CLOUDFLARE_API_TOKEN" \
+            "$HEALTH_URL" \
+            "$KV_NAMESPACE_ID" \
+            "$WORKER_NAME"; do
+            if [[ -z "$value" ]]; then
+              echo "A required Cloudflare secret or variable is missing." >&2
+              exit 1
+            fi
+          done
+
+          curl --fail --silent --show-error \
+            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/workers/scripts/${WORKER_NAME}/settings" \
+            --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            | jq --exit-status '.success == true' > /dev/null
+
+      - name: Record the current production version
+        id: previous
+        if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          version_id="$(curl --fail --silent --show-error \
+            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/workers/scripts/${WORKER_NAME}/deployments" \
+            --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            | jq --exit-status --raw-output '.result.deployments[0].versions[0].version_id')"
+          echo "version_id=$version_id" >> "$GITHUB_OUTPUT"
+
+      - name: Create production Wrangler configuration
+        if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED == 'true'
+        run: |
+          cat > "$RUNNER_TEMP/wrangler.deploy.toml" <<EOF
+          name = "$WORKER_NAME"
+          main = "${GITHUB_WORKSPACE}/_worker.js"
+          compatibility_date = "2026-07-04"
+          keep_vars = true
+          workers_dev = true
+
+          [[kv_namespaces]]
+          binding = "KV"
+          id = "$KV_NAMESPACE_ID"
+          EOF
+
+      - name: Deploy synchronized code
+        id: deploy
+        if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED == 'true'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          npx --yes wrangler@4.107.0 deploy \
+            --config "$RUNNER_TEMP/wrangler.deploy.toml" \
+            --message "Automated upstream sync: ${{ steps.sync.outputs.current_sha }}"
+
+      - name: Check the production endpoint
+        if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED == 'true'
+        run: |
+          curl --fail --silent --show-error \
+            --max-time 30 \
+            --retry 3 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            --output /dev/null \
+            "${HEALTH_URL}/"
+
+      - name: Mark the commit as deployed
+        if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED == 'true'
+        env:
+          CURRENT_SHA: ${{ steps.sync.outputs.current_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh variable set DEPLOYED_SHA --body "$CURRENT_SHA" --repo "$GITHUB_REPOSITORY"
+
+      - name: Roll back after a failed health check
+        if: failure() && steps.deploy.outcome == 'success' && steps.previous.outputs.version_id != ''
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          npx --yes wrangler@4.107.0 rollback \
+            "${{ steps.previous.outputs.version_id }}" \
+            --config "$RUNNER_TEMP/wrangler.deploy.toml" \
+            --message "Automated rollback after a failed health check" \
+            --yes
+
+      - name: Report disabled deployment
+        if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED != 'true'
+        run: echo "Upstream is synchronized; deployment is disabled until the Cloudflare API token is configured."
