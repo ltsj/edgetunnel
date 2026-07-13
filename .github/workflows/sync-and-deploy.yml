@@ -12,7 +12,6 @@ on:
         type: boolean
 
 permissions:
-  actions: write
   contents: write
 
 concurrency:
@@ -36,7 +35,6 @@ jobs:
         env:
           FORCE_DEPLOY: ${{ inputs.force_deploy || false }}
           GH_TOKEN: ${{ github.token }}
-          LAST_DEPLOYED_SHA: ${{ vars.DEPLOYED_SHA }}
         run: |
           response="$(gh api \
             --method POST \
@@ -44,10 +42,11 @@ jobs:
             -f branch=main)"
 
           message="$(jq -r '.message' <<<"$response")"
+          merge_type="$(jq -r '.merge_type' <<<"$response")"
           current_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha')"
           should_deploy=false
 
-          if [[ "$FORCE_DEPLOY" == "true" || "$current_sha" != "$LAST_DEPLOYED_SHA" ]]; then
+          if [[ "$FORCE_DEPLOY" == "true" || "$merge_type" != "none" ]]; then
             should_deploy=true
           fi
 
@@ -57,7 +56,7 @@ jobs:
 
       - name: Check out the synchronized branch
         if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: main
 
@@ -129,6 +128,7 @@ jobs:
             --message "Automated upstream sync: ${{ steps.sync.outputs.current_sha }}"
 
       - name: Check the production endpoint
+        id: health
         if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED == 'true'
         run: |
           curl --fail --silent --show-error \
@@ -139,15 +139,8 @@ jobs:
             --output /dev/null \
             "${HEALTH_URL}/"
 
-      - name: Mark the commit as deployed
-        if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED == 'true'
-        env:
-          CURRENT_SHA: ${{ steps.sync.outputs.current_sha }}
-          GH_TOKEN: ${{ github.token }}
-        run: gh variable set DEPLOYED_SHA --body "$CURRENT_SHA" --repo "$GITHUB_REPOSITORY"
-
       - name: Roll back after a failed health check
-        if: failure() && steps.deploy.outcome == 'success' && steps.previous.outputs.version_id != ''
+        if: failure() && steps.deploy.outcome == 'success' && steps.health.outcome == 'failure' && steps.previous.outputs.version_id != ''
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
