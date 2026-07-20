@@ -19,15 +19,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  sync-and-deploy:
+  sync:
     if: github.repository == 'ltsj/edgetunnel'
     runs-on: ubuntu-latest
-    env:
-      ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
-      AUTODEPLOY_ENABLED: ${{ vars.AUTODEPLOY_ENABLED }}
-      HEALTH_URL: ${{ vars.CF_HEALTH_URL }}
-      KV_NAMESPACE_ID: ${{ vars.CF_KV_NAMESPACE_ID }}
-      WORKER_NAME: ${{ vars.CF_WORKER_NAME }}
+    outputs:
+      current_sha: ${{ steps.sync.outputs.current_sha }}
+      should_deploy: ${{ steps.sync.outputs.should_deploy }}
 
     steps:
       - name: Sync fork with cmliu/edgetunnel
@@ -54,14 +51,35 @@ jobs:
           echo "current_sha=$current_sha" >> "$GITHUB_OUTPUT"
           echo "should_deploy=$should_deploy" >> "$GITHUB_OUTPUT"
 
+  deploy:
+    name: Deploy to ${{ matrix.environment }}
+    needs: sync
+    if: needs.sync.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}
+    strategy:
+      fail-fast: false
+      matrix:
+        environment:
+          - cloudflare-1
+          - cloudflare-2
+    env:
+      ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+      AUTODEPLOY_ENABLED: ${{ vars.AUTODEPLOY_ENABLED }}
+      HEALTH_URL: ${{ vars.CF_HEALTH_URL }}
+      KV_NAMESPACE_ID: ${{ vars.CF_KV_NAMESPACE_ID }}
+      WORKER_NAME: ${{ vars.CF_WORKER_NAME }}
+
+    steps:
       - name: Check out the synchronized branch
-        if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED == 'true'
+        if: vars.AUTODEPLOY_ENABLED == 'true'
         uses: actions/checkout@v6
         with:
           ref: main
 
       - name: Validate deployment configuration
-        if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED == 'true'
+        id: config
+        if: vars.AUTODEPLOY_ENABLED == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
@@ -77,14 +95,20 @@ jobs:
             fi
           done
 
-          curl --fail --silent --show-error \
-            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/workers/scripts/${WORKER_NAME}/settings" \
+          response="$(curl --fail --silent --show-error \
+            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/workers/scripts" \
             --header "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
-            | jq --exit-status '.success == true' > /dev/null
+          )"
+
+          jq --exit-status '.success == true' <<<"$response" > /dev/null
+          worker_exists="$(jq --arg name "$WORKER_NAME" \
+            '[.result[] | select(.id == $name)] | length > 0' \
+            <<<"$response")"
+          echo "worker_exists=$worker_exists" >> "$GITHUB_OUTPUT"
 
       - name: Record the current production version
         id: previous
-        if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED == 'true'
+        if: vars.AUTODEPLOY_ENABLED == 'true' && steps.config.outputs.worker_exists == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
@@ -95,7 +119,7 @@ jobs:
           echo "version_id=$version_id" >> "$GITHUB_OUTPUT"
 
       - name: Create production Wrangler configuration
-        if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED == 'true'
+        if: vars.AUTODEPLOY_ENABLED == 'true'
         run: |
           cat > "$RUNNER_TEMP/wrangler.deploy.toml" <<EOF
           name = "$WORKER_NAME"
@@ -118,18 +142,18 @@ jobs:
 
       - name: Deploy synchronized code
         id: deploy
-        if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED == 'true'
+        if: vars.AUTODEPLOY_ENABLED == 'true'
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           npx --yes wrangler@4.107.0 deploy \
             --config "$RUNNER_TEMP/wrangler.deploy.toml" \
-            --message "Automated upstream sync: ${{ steps.sync.outputs.current_sha }}"
+            --message "Automated upstream sync: ${{ needs.sync.outputs.current_sha }}"
 
       - name: Check the production endpoint
         id: health
-        if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED == 'true'
+        if: vars.AUTODEPLOY_ENABLED == 'true'
         run: |
           curl --fail --silent --show-error \
             --max-time 30 \
@@ -152,5 +176,5 @@ jobs:
             --yes
 
       - name: Report disabled deployment
-        if: steps.sync.outputs.should_deploy == 'true' && vars.AUTODEPLOY_ENABLED != 'true'
-        run: echo "Upstream is synchronized; deployment is disabled until the Cloudflare API token is configured."
+        if: vars.AUTODEPLOY_ENABLED != 'true'
+        run: echo "Deployment to ${{ matrix.environment }} is disabled until its Cloudflare configuration is complete."
