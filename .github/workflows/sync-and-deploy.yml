@@ -151,6 +151,25 @@ jobs:
             --config "$RUNNER_TEMP/wrangler.deploy.toml" \
             --message "Automated upstream sync: ${{ needs.sync.outputs.current_sha }}"
 
+      - name: Configure Worker secrets
+        if: vars.AUTODEPLOY_ENABLED == 'true'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          WORKER_ADMIN: ${{ secrets.WORKER_ADMIN }}
+          WORKER_UUID: ${{ secrets.WORKER_UUID }}
+        run: |
+          for value in "$WORKER_ADMIN" "$WORKER_UUID"; do
+            if [[ -z "$value" ]]; then
+              echo "A required Worker secret is missing." >&2
+              exit 1
+            fi
+          done
+
+          node -e 'process.stdout.write(JSON.stringify({ ADMIN: process.env.WORKER_ADMIN, UUID: process.env.WORKER_UUID }))' \
+            | npx --yes wrangler@4.107.0 secret bulk \
+              --config "$RUNNER_TEMP/wrangler.deploy.toml"
+
       - name: Check the production endpoint
         id: health
         if: vars.AUTODEPLOY_ENABLED == 'true'
